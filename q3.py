@@ -1,6 +1,11 @@
 import numpy as np
 import matplotlib.pyplot as plt
 
+
+# square, only draws the square
+# full, filament replacement first then draws the square
+SCENARIO = 'square'
+
 # parameters
 r_m = 0.005
 J_m = 5.0e-6
@@ -34,6 +39,11 @@ L_new = 1.0
 e_ratio = 0.033
 tol = 0.5e-3
 T_move = 1.0
+T_edge = 1.5
+
+#tolerances for the corner guard 
+tol_theta = 0.01     
+tol_omega = 0.2      
 
 # motor model
 D = J_m + 0.5 * m * r_m**2
@@ -63,12 +73,22 @@ C = np.array([
     [r_m/2, -r_m/2, 0, 0, 0, 0]
 ])
 
+square_modes = ['square1', 'square2', 'square3', 'square4']
+
 
 def derivative(f):
     return np.gradient(f, dt, edge_order=2)
 
 
-# calculate motor voltages
+# motor angles needed to be at point (x, y)
+def xy_to_theta(point):
+    x, y = point
+    theta_l = (x + y) / r_m
+    theta_r = (x - y) / r_m
+    return np.array([theta_l, theta_r])
+
+
+#calculating the motor voltages
 def feedforward(x, y):
     theta_l = (x + y) / r_m
     theta_r = (x - y) / r_m
@@ -98,7 +118,10 @@ def feedforward(x, y):
 
 # move
 def moveto(points, T_edge):
-    t = np.arange(0, 1, dt/T_edge)
+    t = np.linspace(0, 1, int(T_edge / dt) + 1)
+
+   
+    s = 3 * t**2 - 2 * t**3
 
     x = []
     y = []
@@ -107,16 +130,14 @@ def moveto(points, T_edge):
         x0, y0 = points[i]
         x1, y1 = points[i+1]
 
-        x.extend(x0 + t * (x1 - x0))
-        y.extend(y0 + t * (y1 - y0))
+        x.extend(x0 + s * (x1 - x0))
+        y.extend(y0 + s * (y1 - y0))
 
     return feedforward(np.array(x), np.array(y))
 
 
-corners = [(0.12, 0.28), (0.22, 0.23), (0.28, 0.03)]
-T_edge = 1.5
-
-X_tri, U_tri = moveto(corners + [corners[0]], T_edge)
+# corners of the square
+square_corners = [(0.095, 0.095), (0.195, 0.095), (0.195, 0.195), (0.095, 0.195)]
 
 
 # plan a new movement
@@ -135,18 +156,20 @@ def inputs(q, h):
         if h['k'] < h['U'].shape[1]:
             return h['U'][:, h['k']]
 
+    if q == 'approach' or q in square_modes:
+        if h['k'] < h['U'].shape[1]:
+            return h['U'][:, h['k']]
+
     return np.zeros(2)
 
 
-# update the system
+# updating the system
 def f(q, X, u, h):
     X = X + dt * (A @ X + B @ u)
     h['tau'] = h['tau'] + dt
     h['k'] = h['k'] + 1
 
-    x, y = C @ X
-
-    if q == 'print':
+    if q == 'print' or q in square_modes:
         velocity = C[:, 0:2] @ X[2:4]
         h['lf'] = h['lf'] - dt * e_ratio * np.linalg.norm(velocity)
 
@@ -161,9 +184,23 @@ def f(q, X, u, h):
     return X
 
 
+# corner guard
+def corner_reached(X, h):
+    theta_l, theta_r, w_l, w_r = X[0], X[1], X[2], X[3]
+    target_l, target_r = h['theta_target']
+
+    angle_ok = abs(theta_l - target_l) <= tol_theta and abs(theta_r - target_r) <= tol_theta
+    stopped = abs(w_l) <= tol_omega and abs(w_r) <= tol_omega
+
+    return angle_ok and stopped
+
+
 # check when to change mode
 def event(q, X, h):
     x, y = C @ X
+
+    if q == 'approach' or q in square_modes:
+        return corner_reached(X, h)
 
     if q == 'print':
         return h['lf'] <= 0
@@ -190,7 +227,8 @@ def event(q, X, h):
         return h['Tn'] >= T_high
 
     if q == 'return':
-        return np.sqrt((x-h['xs'])**2 + (y-h['ys'])**2) <= tol
+       
+        return np.sqrt((x-h['xs'])**2 + (y-h['ys'])**2) <= tol and h['k'] >= h['U'].shape[1]
 
     return False
 
@@ -202,10 +240,27 @@ def jump(q, X, h):
 
     x, y = C @ X
 
+    # square: approach, square1, square2, square3, square4, done
+    if q == 'approach' or q in square_modes:
+        h['hits'].append((x, y))     
+
+        if q == 'square4':
+            return 'done', X
+
+        if q == 'approach':
+            n = 1
+        else:
+            n = int(q[-1]) + 1        
+
+        
+        target = square_corners[n]
+        h['theta_target'] = xy_to_theta(target)
+        plan(h, [(x, y), target], T_edge)
+        return 'square' + str(n), X
+
     if q == 'print':
         h['xs'] = x
         h['ys'] = y
-        h['edge'] = h['k'] // int(T_edge / dt)
         return 'save', X
 
     if q == 'save':
@@ -254,12 +309,13 @@ def jump(q, X, h):
         return 'return', X
 
     if q == 'return':
-        points = [(x, y)] + corners[h['edge']+1:] + [corners[0]]
-        plan(h, points, T_edge)
-        return 'print', X
+        h['theta_target'] = xy_to_theta(square_corners[0])
+        plan(h, [(x, y), square_corners[0]], T_move)
+        return 'approach', X
+
+    return q, X
 
 
-# run the simulation
 def simulate(q, X, h, t_end=60):
     t = 0
 
@@ -267,11 +323,11 @@ def simulate(q, X, h, t_end=60):
     modes = []
     xs = []
     ys = []
-    temps = []
-    lengths = []
+    th_l = []
+    th_r = []
 
     while t < t_end:
-        if q == 'print' and h['k'] >= h['U'].shape[1]:
+        if q == 'done':
             break
 
         u = inputs(q, h)
@@ -289,17 +345,14 @@ def simulate(q, X, h, t_end=60):
         modes.append(q)
         xs.append(x)
         ys.append(y)
-        temps.append(h['Tn'])
-        lengths.append(h['lf'])
+        th_l.append(X[0])
+        th_r.append(X[1])
 
     return (np.array(times), np.array(xs), np.array(ys),
-            np.array(temps), np.array(lengths), modes)
+            np.array(th_l), np.array(th_r), modes)
 
 
 # initial values
-q = 'print'
-X = X_tri[:, 0]
-
 h = {
     'tau': 0,
     'lf': L_start,
@@ -307,40 +360,68 @@ h = {
     'xs': 0,
     'ys': 0,
     'k': 0,
-    'U': U_tri,
-    'edge': 0
+    'U': np.zeros((2, 0)),
+    'theta_target': xy_to_theta(square_corners[0]),
+    'hits': []
 }
 
-t, x, y, temp, length, modes = simulate(q, X, h)
+if SCENARIO == 'full':
+    corners = [(0.12, 0.28), (0.22, 0.23), (0.28, 0.03)]
+    X_tri, h['U'] = moveto(corners + [corners[0]], T_edge)
+    q = 'print'
+    X = X_tri[:, 0]
+else:
+    q = 'approach'
+    X = np.zeros(6)
+    X[0:2] = xy_to_theta(square_corners[0])
+    h['lf'] = L_new
+
+t, x, y, th_l, th_r, modes = simulate(q, X, h)
 
 
-# position graph
+# check the square's edge lengths and corner angles
+P = np.array(h['hits'])     
+
+edges = []
+for i in range(4):
+    edge = P[i+1] - P[i]
+    edges.append(edge)
+    print('edge', i+1, 'length:', round(np.linalg.norm(edge) * 1000, 3), 'mm')
+
+for i in range(4):
+    e1 = edges[i-1]
+    e2 = edges[i]
+    cos_angle = np.dot(-e1, e2) / (np.linalg.norm(e1) * np.linalg.norm(e2))
+    angle = np.degrees(np.arccos(cos_angle))
+    print('corner', i+1, 'angle:', round(angle, 3), 'deg')
+
+
+# square graph
 plt.figure()
-plt.plot(t, x * 1000, label='x')
-plt.plot(t, y * 1000, label='y')
+plt.plot(x * 1000, y * 1000)
+plt.xlabel('x (mm)')
+plt.ylabel('y (mm)')
+plt.title('Square path')
+plt.axis('equal')
+plt.grid()
+plt.show()
+
+
+# motor angle graph
+plt.figure()
+plt.plot(t, th_l, label='theta_l')
+plt.plot(t, th_r, label='theta_r')
 plt.xlabel('time (s)')
-plt.ylabel('position (mm)')
-plt.title('Position vs time')
+plt.ylabel('motor angle (rad)')
+plt.title('Motor angles')
 plt.legend()
 plt.grid()
 plt.show()
 
 
-# temperature graph
-plt.figure()
-plt.plot(t, temp)
-plt.axhline(T_low, linestyle='--', color='g')
-plt.axhline(T_high, linestyle='--', color='r')
-plt.xlabel('time (s)')
-plt.ylabel('temperature (C)')
-plt.title('Nozzle temperature')
-plt.grid()
-plt.show()
-
-
 # mode graph
-mode_names = ['print', 'save', 'H', 'V', 'wipe',
-              'cool', 'load', 'heat', 'return']
+mode_names = ['print', 'save', 'H', 'V', 'wipe', 'cool', 'load', 'heat', 'return',
+              'approach', 'square1', 'square2', 'square3', 'square4', 'done']
 
 mode_numbers = []
 
@@ -349,6 +430,7 @@ for q in modes:
 
 plt.figure()
 plt.step(t, mode_numbers)
+plt.yticks(range(len(mode_names)), mode_names)
 plt.xlabel('time (s)')
 plt.ylabel('mode')
 plt.title('Mode vs time')
