@@ -253,7 +253,7 @@ def jump(q, X, h):
             n = int(q[-1]) + 1        
 
         
-        target = square_corners[n]
+        target = square_corners[n % 4]
         h['theta_target'] = xy_to_theta(target)
         plan(h, [(x, y), target], T_edge)
         return 'square' + str(n), X
